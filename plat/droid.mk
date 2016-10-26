@@ -17,11 +17,8 @@ CROSS_COMPILE := arm-linux-androideabi
 SYSROOT := $(NDK_HOME)/platforms/$(BUILD_SDK)/arch-arm
 
 # Include base Makefile
+TARGET_OS := Android
 include $(CURDIR)/Makefile
-
-# C flags
-CFLAGS   := $(CFLAGS) -fPIC
-LDFLAGS  := $(LDFLAGS) -shared
 
 #---------------------------------------------------------------
 # Outputs
