@@ -113,7 +113,7 @@ droidbuild: droidenvvars droidinfo $(APK_ALIGNED)
 # Install
 droidinstall: droidbuild
 	$(info $(LRED_COLOR)[+] Installing$(NO_COLOR) $(LYELLOW_COLOR)apk file...$(NO_COLOR))
-	@adb uninstall -k $(PACKAGE) $(suppress_out)
+	@adb uninstall $(PACKAGE) $(suppress_out)
 	@adb install -r $(APK_ALIGNED) $(suppress_out)
 
 # Set the default goal to main android build rule
