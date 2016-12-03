@@ -26,6 +26,7 @@
 #  [5] contains executable results
 #  [6] contains library results (static or shared)
 #  [7] contains intermediate object files of compiling processes
+MAKEFLAGS += --no-builtin-rules
 
 # CreateProcess NULL bug
 ifeq ($(OS), Windows_NT)
@@ -46,6 +47,8 @@ SILENT ?=
 VERBOSE ?=
 # Default target OS is host if not provided
 TARGET_OS ?= $(OS)
+# Install location
+LOCAL_REPO ?= $(HOME)/.local
 
 #---------------------------------------------------------------
 # Helpers
@@ -90,6 +93,22 @@ else
 endif
 rmdir = $(if $(wildcard $(1)/.*), $(RMDIR_CMD) $(call native_path, $(1)),)
 
+# Copy command
+ifeq ($(OS), Windows_NT)
+	COPY_CMD = copy /Y
+else
+	COPY_CMD = cp
+endif
+copy = $(COPY_CMD) $(call native_path, $(1)) $(call native_path, $(2)) $(suppress_out)
+
+# Recursive folder copy command
+ifeq ($(OS), Windows_NT)
+	RCOPY_CMD = robocopy /S /E $(call native_path, $(1)) $(call native_path, $(2)) $(suppress_out)$(ignore_err)
+else
+	RCOPY_CMD = cp -r $(call native_path, $(1))/* $(call native_path, $(2))
+endif
+rcopy = $(RCOPY_CMD)
+
 # Path separator
 pathsep = $(strip $(if $(filter $(OS), Windows_NT), ;, :))
 
@@ -130,6 +149,15 @@ gatherprojs = $(strip $(patsubst ./%, %, $(patsubst %/config.mk, %, $(sort $(cal
 
 # Search for library in given paths
 searchlibrary = $(foreach sd, $2, $(call findfile, $(sd), $1))
+# Parse libraryname::version pairs
+lib-from-extlib-pair = $(firstword $(subst ::, , $(1)))
+ver-from-extlib-pair = $(strip $(or $(lastword $(subst ::, , $(1))), dev))
+# Construct base path to repo dependency
+extdep-pair = $(strip $(call lc,$(1)))::$(strip $(2))
+extdep-path = $(LOCAL_REPO)/builds/$(subst ::,/,$(call extdep-pair, $(1), $(2)))
+extdep-conf = $(call extdep-path, \
+					$(call lib-from-extlib-pair, $(1)), \
+					$(call ver-from-extlib-pair, $(1)))/pkg.mk
 
 #---------------------------------------------------------------
 # Global constants
@@ -287,6 +315,17 @@ $(BUILDDIR)/$(VARIANT)/$(strip $(3))%.$(strip $(1))$(OBJEXT): $(strip $(3))%.$(s
 endef
 
 #---------------------------------------------------------------
+# Meta
+#---------------------------------------------------------------
+# Used by project generators to make $(D) and $(DP) variables available
+define subproj-template-prologue
+# Subproject name
+$(eval D = $(strip $(1)))
+# Subproject path
+$(eval DP = $(if $(filter $(D),.),,$(D)/))
+endef
+
+#---------------------------------------------------------------
 # Per project configuration
 #---------------------------------------------------------------
 # Should at least define:
@@ -302,49 +341,52 @@ endef
 # - ADDINCS variable (list with additional include dirs)
 # - MOREDEPS variable (list with additional dep dirs)
 
-define gen-build-rules
-# Subproject name
-$(eval D = $(strip $(1)))
-# Subproject path
-$(eval DP = $(if $(filter $(D),.),,$(D)/))
-
+# Parses given subproject configuration to _$(subproj) postfixed variables.
+# Fills in with defaults on some values if not given.
+define parse-subproject-config
+${subproj-template-prologue}
 # Clear previous variables
-$(foreach v, PRJTYPE LIBS SRCDIR SRC DEFINES ADDINCS MOREDEPS, undefine $(v)${\n})
+$(foreach v, PRJTYPE VERSION DEFINES LIBS MOREDEPS EXTDEPS SRCDIR SRC ADDINCS ADDLIBDIR MCFLAGS MLDFLAGS, undefine $(v)${\n})
 
 # Include configuration
 -include $(DP)config.mk
 
 # Gather variables from config
 PRJTYPE_$(D)   := $$(PRJTYPE)
-SRCDIR_$(D)    := $$(foreach d, $$(SRCDIR), $(DP)$$(d))
-SRC_$(D)       := $$(foreach s, $$(SRC), $(DP)$$(s))
+VERSION_$(D)   := $$(VERSION)
 DEFINES_$(D)   := $$(DEFINES)
-ADDINCS_$(D)   := $$(foreach ai, $$(ADDINCS), $(DP)$$(ai))
-ADDLIBDIR_$(D) := $$(foreach ald, $$(ADDLIBDIR), $(DP)$$(ald))
-LIBS_$(D)      := $$(foreach l, $$(LIBS), $$(l))
+LIBS_$(D)      := $$(LIBS)
 MOREDEPS_$(D)  := $$(MOREDEPS)
+EXTDEPS_$(D)   := $$(EXTDEPS)
+MCFLAGS_$(D)   := $$(MCFLAGS)
+MLDFLAGS_$(D)  := $$(MLDFLAGS)
+# Variables refering to local project paths,
+# must be prefixed with subproject path
+SRCDIR_$(D)    := $$(addprefix $(DP), $$(SRCDIR))
+SRC_$(D)       := $$(addprefix $(DP), $$(SRC))
+ADDINCS_$(D)   := $$(addprefix $(DP), $$(ADDINCS))
+ADDLIBDIR_$(D) := $$(addprefix $(DP), $$(ADDLIBDIR))
 
 # Set defaults on unset variables
+VERSION_$(D)    := $$(strip $$(or $$(VERSION_$(D)), dev))
 TARGETNAME_$(D) := $$(or $$(TARGETNAME_$(D)), $$(notdir $$(if $$(filter $(D),.), $$(CURDIR), $(D))))
 SRCDIR_$(D)     := $$(or $$(SRCDIR_$(D)), $(DP)src)
 SRCEXT_$(D)     := *.c *.cpp *.cc *.cxx
 SRC_$(D)        := $$(or $$(SRC_$(D)), $$(call rwildcard, $$(SRCDIR_$(D)), $$(SRCEXT_$(D))))
+endef
 
+#---------------------------------------------------------------
+# Populated values
+#---------------------------------------------------------------
+#=- Populate core project target values
+define populate-target-values
+${subproj-template-prologue}
 # Target directory
 ifeq ($$(PRJTYPE_$(D)), Executable)
 	TARGETDIR_$(D) := $(DP)bin
 else
 	TARGETDIR_$(D) := $(DP)lib
 endif
-
-#---------------------------------------------------------------
-# Generated values
-#---------------------------------------------------------------
-# Objects
-OBJ_$(D) := $$(foreach obj, $$(SRC_$(D):=$(OBJEXT)), $(BUILDDIR)/$(VARIANT)/$$(obj))
-# Header dependencies
-HDEPS_$(D) := $$(OBJ_$(D):$(OBJEXT)=$(HDEPEXT))
-
 # Output
 ifeq ($$(PRJTYPE_$(D)), StaticLib)
 	TARGET_$(D) := $(SLIBPREF)$$(strip $$(call lc,$$(TARGETNAME_$(D))))$(SLIBEXT)
@@ -353,75 +395,115 @@ else ifeq ($$(PRJTYPE_$(D)), DynLib)
 else
 	TARGET_$(D) := $$(TARGETNAME_$(D))$(EXECEXT)
 endif
+# Master output full path
+MASTEROUT_$(D) := $$(TARGETDIR_$(D))/$(VARIANT)/$$(TARGET_$(D))
+# Objects
+OBJ_$(D) := $$(addprefix $(BUILDDIR)/$(VARIANT)/, $$(SRC_$(D):=$(OBJEXT)))
+# Header dependencies
+HDEPS_$(D) := $$(OBJ_$(D):$(OBJEXT)=$(HDEPEXT))
+# Install location
+INSTALL_PREFIX_$(D) := $$(call extdep-path, $$(TARGETNAME_$(D)), $$(VERSION_$(D)))
+# Install pair
+INSTALL_PAIR_$(D)   := $$(call extdep-pair, $$(TARGETNAME_$(D)), $$(VERSION_$(D)))
+endef
 
-# Master output
-ifdef PRJTYPE_$(D)
-	MASTEROUT_$(D) := $$(TARGETDIR_$(D))/$(VARIANT)/$$(TARGET_$(D))
-endif
+#--------------------------------------------------
+#- Read external pkg file for given dependency
+define read-ext
+-include $$(call extdep-conf, $(1))
+PKGS += $$(PKGDEPS)
+endef
 
+#=- Populate project dependency values
+define populate-dep-values
+${subproj-template-prologue}
 # Implicit dependencies directory
 DEPSDIR_$(D) := $(DP)deps
 # Implicit dependencies
 DEPS_$(D) := $$(call gatherprojs, $$(DEPSDIR_$(D)))
 # Explicit dependencies
 DEPS_$(D) += $$(foreach md, $$(MOREDEPS_$(D)), $$(or $$(call canonical_path_cur, $(DP)/$$(md)), .))
+# Append dependency pairs from local dependencies
+undefine PKGS
+PKGS :=
+$$(foreach dep, $$(EXTDEPS_$(D)), $$(eval $$(call read-ext, $$(dep))))
+EXTDEPS_$(D) += $$(PKGS)
+endef
 
-# Preprocessor flags
-CPPFLAGS_$(D) := $$(strip $$(foreach define, $$(DEFINES_$(D)), $(DEFINEFLAG)$$(define)))
-
-# Include directories (implicit)
-INCDIR_$(D) := $$(strip $(INCFLAG)$(DP)include \
+#--------------------------------------------------
+#=- Populate project path values
+define populate-path-values
+${subproj-template-prologue}
+# External (repo installed) dependency directories
+EXTDEPPATHS_$(D) := $$(foreach ed, $$(EXTDEPS_$(D)), $$(call extdep-path, \
+						$$(call lib-from-extlib-pair, $$(ed)), \
+						$$(call ver-from-extlib-pair, $$(ed))))
+# Include search paths
+INCPATHS_$(D)    := $$(strip $(DP)include \
 						$$(foreach dep, $$(DEPS_$(D)) \
 										$$(filter-out $$(DEPS_$(D)), $$(wildcard $$(DEPSDIR_$(D))/*)), \
-										$(INCFLAG)$$(dep)/include))
-
-# Include directories (explicit)
-INCDIR_$(D) += $$(strip $$(foreach addinc, $$(ADDINCS_$(D)), $(INCFLAG)$$(addinc)))
-
+											$$(dep)/include) \
+						$$(ADDINCS_$(D)) \
+						$$(foreach extdep, $$(EXTDEPPATHS_$(D)), $$(extdep)/include))
 # Library search paths
-LIBPATHS_$(D) := $$(strip $$(foreach libdir,\
+LIBPATHS_$(D)    := $$(strip $$(foreach libdir,\
 									$$(foreach dep, $$(DEPS_$(D)), $$(dep)/lib) \
 									$$(ADDLIBDIR_$(D)),\
-								$$(libdir)/$(strip $(VARIANT))))
+								$$(libdir)/$(strip $(VARIANT))) \
+								$$(foreach extdep, $$(EXTDEPPATHS_$(D)), $$(extdep)/lib))
+endef
 
+#--------------------------------------------------
+#=- Populate project flag values
+define populate-flag-values
+${subproj-template-prologue}
+# Preprocessor flags
+CPPFLAGS_$(D) := $$(addprefix $(DEFINEFLAG), $$(DEFINES_$(D)))
+# Include path flags
+INCDIR_$(D)   := $$(addprefix $(INCFLAG), $$(INCPATHS_$(D)))
 # Library path flags
-LIBSDIR_$(D) := $$(strip $$(foreach lp, $$(LIBPATHS_$(D)), $(LIBSDIRFLAG)$$(lp)))
-
+LIBSDIR_$(D)  := $$(addprefix $(LIBSDIRFLAG), $$(LIBPATHS_$(D)))
 # Library flags
 LIBFLAGS_$(D) := $$(strip $$(foreach lib, $$(LIBS_$(D)), $(LIBFLAG)$$(lib)$(if $(filter $(TOOLCHAIN), MSVC),.lib,)))
-
 # Extra link flags when building shared libraries
 ifeq ($$(PRJTYPE_$(D)), DynLib)
 	# Add shared library toggle
 	MORELFLAGS_$(D) := $(LSOFLAGS)
 endif
-
 # Setup rpath flag parameter for linux systems
 ifeq ($$(PRJTYPE_$(D)), Executable)
 ifneq ($(TARGET_OS), Windows_NT)
 	# Path from executable location to project root
-	RELPPREFIX_$(D) := $$(subst $$(space),,$$(foreach dir, $$(subst /,$$(space),$$(dir $$(MASTEROUT_$(D)))),../))
+	RELPPREFIX_$(D)  := $$(subst $$(space),,$$(foreach dir, $$(subst /,$$(space),$$(dir $$(MASTEROUT_$(D)))),../))
 	# Library paths relative to the executable
-	LIBRELPATHS_$(D) := $$(strip $$(foreach p, $$(LIBPATHS_$(D)), $$(RELPPREFIX_$(D))$$(p)))
+	LIBRELPATHS_$(D) := $$(addprefix $$(RELPPREFIX_$(D)), $$(LIBPATHS_$(D)))
 	# Add rpath param to search for dependent shared libraries relative to the executable location
-	MORELFLAGS_$(D) := '-Wl$$(comma)-rpath$$(comma)$$(subst $$(space),:,$$(addprefix $$$$ORIGIN/, $$(LIBRELPATHS_$(D))))'
+	MORELFLAGS_$(D)  := '-Wl$$(comma)-rpath$$(comma)$$(subst $$(space),:,$$(addprefix $$$$ORIGIN/, $$(LIBRELPATHS_$(D))))'
 endif
 endif
+endef
 
+#--------------------------------------------------
+#=- Populate project rule dependency values
+define populate-rule-dep-values
+${subproj-template-prologue}
 # Build rule dependencies
-BUILDDEPS_$(D) := $$(foreach dep, $$(DEPS_$(D)), build_$$(strip $$(dep)))
-
-# Link rule dependencies
-ifneq ($$(PRJTYPE_$(D)), StaticLib)
-LIBDEPS_$(D) = $$(foreach dep, $$(DEPS_$(D)), \
-					$$(if $$(or $$(filter $$(PRJTYPE_$$(strip $$(dep))), StaticLib), \
-								$$(filter $$(PRJTYPE_$$(strip $$(dep))), DynLib)), \
-						$$(MASTEROUT_$$(strip $$(dep)))))
+BUILDDEPS_$(D) := $$(foreach dep, $$(DEPS_$(D)), $$(MASTEROUT_$$(dep)))
+# Install dependencies for static library
+ifeq ($$(PRJTYPE_$(D)), StaticLib)
+INSTDEPS_$(D) := $$(addprefix install_, $$(DEPS_$(D)))
 endif
+endef
 
 #---------------------------------------------------------------
 # Rules
 #---------------------------------------------------------------
+# Generate rules for the given project
+define gen-build-rules
+${subproj-template-prologue}
+# Dummy banner file for current project build
+BANNERFILE_$(D) := $(BUILDDIR)/banners/banner_$(subst /,_,$(D))
+
 # Main build rule
 build_$(D): $$(MASTEROUT_$(D))
 
@@ -431,15 +513,33 @@ run_$(D): build_$(D)
 	@$$(eval export PATH := $(PATH)$(pathsep)$$(subst $$(space),$(pathsep),$$(addprefix $$(CURDIR)/, $$(LIBPATHS_$(D)))))
 	@cd $(D) && $$(call native_path, $$(call canonical_path, $$(abspath $$(CURDIR)/$(D)), $$(MASTEROUT_$(D))))
 
-# Show banner for current build execution
-banner_$(D):
-	$$(info $(LRED_COLOR)[o] Building$(NO_COLOR) $(LMAGENTA_COLOR)$$(TARGETNAME_$(D))$(NO_COLOR))
+ifneq ($$(PRJTYPE_$(D)), Executable)
+# Pkg.mk file contents
+define PCFG_$(D)
+PKGDEPS := $$(strip $$(EXTDEPS_$(D)) $$(foreach dep, $$(DEPS_$(D)), $$(INSTALL_PAIR_$$(dep))))
+endef
 
-# Build objects for target
-objects_$(D): $$(OBJ_$(D))
+# Installs target to repository
+install_$(D): $$(INSTDEPS_$(D)) $$(MASTEROUT_$(D))
+	$$(info $(LGREEN_COLOR)[>] Installing$(NO_COLOR) $(LYELLOW_COLOR)$$(TARGETNAME_$(D)) to $$(subst \,/,$$(INSTALL_PREFIX_$(D)))$(NO_COLOR))
+	$(showcmd)$$(call mkdir, $$(INSTALL_PREFIX_$(D))/lib)
+	$(showcmd)$$(call mkdir, $$(INSTALL_PREFIX_$(D))/include)
+	$(showcmd)$$(call rcopy, $(DP)include, $$(INSTALL_PREFIX_$(D))/include)
+	$(showcmd)$$(call copy, $$(MASTEROUT_$(D)), $$(INSTALL_PREFIX_$(D))/lib)
+	$(showcmd)echo $$(PCFG_$(D)) > $$(call extdep-conf, $$(INSTALL_PAIR_$(D)))
+endif
+
+# Show banner for current build execution
+$$(BANNERFILE_$(D)):
+	@$$(call mkdir, $$(@D))
+	$$(info $(LRED_COLOR)[o] Building$(NO_COLOR) $(LMAGENTA_COLOR)$$(TARGETNAME_$(D))$(NO_COLOR))
+	@echo Bum. > $$@
+
+# Show banner if not shown
+$$(OBJ_$(D)): | $$(BANNERFILE_$(D))
 
 # Print build debug info
-showvars_$(D): banner_$(D)
+showvars_$(D): $$(BANNERFILE_$(D))
 	@echo MASTEROUT: $$(MASTEROUT_$(D))
 	@echo SRCDIR:    $$(SRCDIR_$(D))
 	@echo SRC:       $$(SRC_$(D))
@@ -450,15 +550,25 @@ showvars_$(D): banner_$(D)
 	@echo INCDIR:    $$(INCDIR_$(D))
 	@echo LIBSDIR:   $$(LIBSDIR_$(D))
 	@echo LIBFLAGS:  $$(LIBFLAGS_$(D))
-	@echo LIBDEPS:   $$(LIBDEPS_$(D))
 	@echo HDEPS:     $$(HDEPS_$(D))
+	@echo INSTALL:   $$(INSTALL_PREFIX_$(D))
+	@echo EXTDEPS:   $$(EXTDEPS_$(D))
+	@echo EXTPATHS:  $$(EXTDEPPATHS_$(D))
 
-$$(MASTEROUT_$(D)): $$(BUILDDEPS_$(D)) banner_$(D) objects_$(D)
+# Show include search paths for current subproject
+showincpaths_$(D):
+	$$(info $$(INCPATHS_$(D)))
+
+# Show defines for current subproject
+showdefines_$(D):
+	$$(info $$(DEFINES_$(D)))
+
+$$(MASTEROUT_$(D)): $$(BUILDDEPS_$(D)) $$(OBJ_$(D))
 ifneq ($$(PRJTYPE_$(D)), StaticLib)
 # Link rule
 	@$$(info $(DGREEN_COLOR)[+] Linking$(NO_COLOR) $(DYELLOW_COLOR)$$@$(NO_COLOR))
 	@$$(call mkdir, $$(@D))
-	$(showcmd)$(LD) $(LDFLAGS) $$(LIBSDIR_$(D)) $(LOUTFLAG)$$@ $$(OBJ_$(D)) $$(LIBFLAGS_$(D)) $$(MORELFLAGS_$(D))
+	$(showcmd)$(LD) $(LDFLAGS) $$(MLDFLAGS_$(D)) $$(LIBSDIR_$(D)) $(LOUTFLAG)$$@ $$(OBJ_$(D)) $$(LIBFLAGS_$(D)) $$(MORELFLAGS_$(D))
 else
 # Archive rule
 	@$$(info $(DCYAN_COLOR)[+] Archiving$(NO_COLOR) $(DYELLOW_COLOR)$$@$(NO_COLOR))
@@ -467,13 +577,15 @@ else
 endif
 
 # Compile commands
-CCOMPILE_$(D)   = $(CC) $(CFLAGS) $$(CPPFLAGS_$(D)) $$(INCDIR_$(D)) $$< $(COUTFLAG) $$@ $$(MORECFLAGS_$(D))
-CXXCOMPILE_$(D) = $(CXX) $(CFLAGS) $(CXXFLAGS) $$(CPPFLAGS_$(D)) $$(INCDIR_$(D)) $$< $(COUTFLAG) $$@ $$(MORECFLAGS_$(D))
+CCOMPILE_$(D)   = $(CC) $(CFLAGS) $$(MCFLAGS_$(D)) $$(CPPFLAGS_$(D)) $$(INCDIR_$(D)) $$< $(COUTFLAG) $$@ $$(MORECFLAGS_$(D))
+CXXCOMPILE_$(D) = $(CXX) $(CFLAGS) $(CXXFLAGS) $$(MCFLAGS_$(D)) $$(CPPFLAGS_$(D)) $$(INCDIR_$(D)) $$< $(COUTFLAG) $$@ $$(MORECFLAGS_$(D))
 
 # Generate compile rules
 $(call compile-rule, c, $$(CCOMPILE_$(D)), $(DP))
 $(foreach ext, cpp cxx cc, $(call compile-rule, $(ext), $$(CXXCOMPILE_$(D)), $(DP))${\n})
 
+# Include extra rules
+-include $(DP)rules.mk
 endef
 
 #---------------------------------------------------------------
@@ -481,10 +593,20 @@ endef
 #---------------------------------------------------------------
 # Scan all directories for subprojects
 SUBPROJS := $(call gatherprojs, .)
+# Parse subproject configs
+$(foreach subproj, $(SUBPROJS), $(eval $(call parse-subproject-config, $(subproj))))
+# Generate subproject values
+$(foreach generator, \
+			populate-target-values    \
+			populate-dep-values       \
+			populate-path-values      \
+			populate-flag-values      \
+			populate-rule-dep-values, \
+		$(foreach subproj, $(SUBPROJS), $(eval $(call $(generator), $(subproj)))))
 # Create sublists with dependency and main projects
-SILENT_SUBPROJS = $(foreach subproj, $(SUBPROJS), $(if $(findstring deps, $(subproj)), $(subproj)))
-NONSILENT_SUBPROJS = $(filter-out $(SILENT_SUBPROJS), $(SUBPROJS))
-# Generate subproject variables and rules
+SILENT_SUBPROJS    := $(foreach subproj, $(SUBPROJS), $(if $(findstring deps, $(subproj)), $(subproj)))
+NONSILENT_SUBPROJS := $(filter-out $(SILENT_SUBPROJS), $(SUBPROJS))
+# Generate subproject rules
 SILENT := 1
 $(foreach subproj, $(SILENT_SUBPROJS), $(eval $(call gen-build-rules, $(subproj))))
 undefine SILENT
@@ -493,8 +615,9 @@ $(foreach subproj, $(NONSILENT_SUBPROJS), $(eval $(call gen-build-rules, $(subpr
 # Aliases
 build: build_.
 run: run_.
+install: install_.
 showvars: showvars_.
-showvars_all: $(foreach subproj, $(SUBPROJS), showvars_$(subproj))
+showvars_all: $(addprefix showvars_, $(SUBPROJS))
 
 # Track down Dynamic Library projects and find their dependencies
 SO_PROJS := $(strip $(foreach subproj, $(SUBPROJS), $(if $(filter $(PRJTYPE_$(subproj)), DynLib), $(subproj),)))
@@ -522,11 +645,10 @@ endif
 .SUFFIXES:
 
 # Non file targets
-PHONYRULETYPES := run showvars
-PHONYPREREQS := $(foreach ruletype, $(PHONYRULETYPES), $(foreach subproj, $(SUBPROJS), $(ruletype)_$(subproj))) \
+PHONYRULETYPES := build run install showvars showincpaths showdefines
+PHONYPREREQS := $(foreach ruletype, $(PHONYRULETYPES), $(addprefix $(ruletype)_, $(SUBPROJS))) \
 		run \
 		showvars \
 		showvars_all \
 		clean
 .PHONY: $(PHONYPREREQS)
-.SECONDARY:
